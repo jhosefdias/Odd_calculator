@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""
+Agente autônomo para monitorar partidas, atualizar estatísticas e odds,
+gerar análises com Gemini e enviar notificações.
+
+Principais responsabilidades:
+1. Consultar periodicamente a API Football-Data e identificar partidas novas.
+2. Atualizar incrementos em arquivos CSV sem recalcular o histórico inteiro.
+3. Calcular probabilidades/odds apenas para os times afetados.
+4. Gerar análises em lote via Gemini e anexar ao CSV final.
+5. Registrar logs estruturados e enviar resumo opcional via Discord.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import os
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Set
+
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+from importlib.machinery import SourceFileLoader
+
+# Aproveita funções existentes para garantir consistência dos cálculos.
+from analisador_odds import calcular_probabilidades, gerar_analises_em_lote
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+
+MATCH_HISTORY_PATH = DATA_DIR / "matches_history.csv"
+AGGREGATED_PATH = BASE_DIR / "brasileirao_2025_parcial_atualizado.csv"
+AGGREGATED_FALLBACK = BASE_DIR / "brasileirao_2025_parcial.csv"
+ODDS_PATH = BASE_DIR / "brasileirao_2025_odds.csv"
+
+API_BASE_URL = "https://api.football-data.org/v4/matches"
+
+LOGS_DIR = BASE_DIR / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
+
+
+@dataclass
+class AgentConfig:
+    api_token: str
+    competition: str = "BSA"
+    fetch_interval: int = 900  # 15 minutos
+    discord_webhook: Optional[str] = None
+
+
+@dataclass
+class AgentResult:
+    fetched: int = 0
+    new_matches: int = 0
+    teams_updated: Set[str] = None
+    odds_updated: int = 0
+    skipped_reason: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.teams_updated is None:
+            self.teams_updated = set()
+
+
+
+def setup_logging(level: int = logging.INFO) -> None:
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
+    )
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+
+    file_handler = logging.FileHandler(LOGS_DIR / "automation.log")
+    file_handler.setFormatter(formatter)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    root_logger.handlers.clear()
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+
+
+def send_discord_notification(webhook_url: str, message: str) -> None:
+    try:
+        response = requests.post(
+            webhook_url,
+            json={"content": message},
+            timeout=15,
+        )
+        response.raise_for_status()
+        logging.info("Notificação enviada ao Discord.")
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Falha ao enviar notificação ao Discord: %s", exc)
+
+
+def load_interface_module() -> object:
+    """Carrega o módulo da interface para reutilizar exibição se necessário."""
+    interface_path = BASE_DIR / "Terminal" / "Interface"
+    if not interface_path.exists():
+        raise FileNotFoundError(f"Arquivo Interface não encontrado: {interface_path}")
+
+    loader = SourceFileLoader("odds_interface", str(interface_path))
+    module = loader.load_module()  # type: ignore[deprecated-return-value]
+    return module
+
+#agente
+
+class OddsAutomationAgent:
+    def __init__(self, config: AgentConfig) -> None:
+        self.config = config
+        self.session = requests.Session()
+        self.session.headers.update({"X-Auth-Token": config.api_token})
+        self.last_fetch: Optional[datetime] = None
+
+    # ------------------------------ API ---------------------------------- #
+    def fetch_matches(self) -> pd.DataFrame:
+        params = {
+            "competitions": self.config.competition,
+            "status": "FINISHED",
+        }
+
+        if MATCH_HISTORY_PATH.exists():
+            history = pd.read_csv(MATCH_HISTORY_PATH)
+            if not history.empty and "utc_date" in history.columns:
+                last_date = pd.to_datetime(history["utc_date"]).max()
+                if pd.notnull(last_date):
+                    params["dateFrom"] = last_date.strftime("%Y-%m-%d")
+
+        logging.debug("Consultando API Football-Data com params: %s", params)
+
+        response = self.session.get(API_BASE_URL, params=params, timeout=30)
+        response.raise_for_status()
+
+        payload = response.json()
+        matches = payload.get("matches", [])
+        logging.info("Consulta retornou %d partidas.", len(matches))
+
+        data_rows = []
+        for item in matches:
+            try:
+                if item.get("status") != "FINISHED":
+                    continue
+                data_rows.append(
+                    {
+                        "match_id": item["id"],
+                        "utc_date": item["utcDate"],
+                        "home_team": item["homeTeam"]["name"],
+                        "away_team": item["awayTeam"]["name"],
+                        "home_score": item["score"]["fullTime"]["home"],
+                        "away_score": item["score"]["fullTime"]["away"],
+                        "winner": item["score"].get("winner"),
+                        "competition": item.get("competition", {}).get("name", ""),
+                    }
+                )
+            except KeyError:
+                logging.debug("Partida ignorada por dados incompletos: %s", item)
+
+        return pd.DataFrame(data_rows)
+
+    
+
+    def load_match_history(self) -> pd.DataFrame:
+        if MATCH_HISTORY_PATH.exists():
+            return pd.read_csv(MATCH_HISTORY_PATH)
+        return pd.DataFrame(
+            columns=[
+                "match_id",
+                "utc_date",
+                "home_team",
+                "away_team",
+                "home_score",
+                "away_score",
+                "winner",
+                "competition",
+            ]
+        )
+
+    def persist_match_history(self, history_df: pd.DataFrame) -> None:
+        history_df.to_csv(MATCH_HISTORY_PATH, index=False, encoding="utf-8-sig")
+        logging.info("Histórico de partidas atualizado (%s).", MATCH_HISTORY_PATH)
+
+    # ---------------------- Atualização incremental ----------------------- #
+
+    @staticmethod
+    def _ensure_team_row(df: pd.DataFrame, team: str) -> None:
+        if team not in df.index:
+            df.loc[team] = {
+                "gols_marcados": 0,
+                "gols_sofridos": 0,
+                "cartões": 0,
+                "vitórias": 0,
+                "empates": 0,
+                "derrotas": 0,
+                "partidas": 0,
+            }
+
+    def _load_aggregated_table(self) -> pd.DataFrame:
+        if AGGREGATED_PATH.exists():
+            df = pd.read_csv(AGGREGATED_PATH)
+        elif AGGREGATED_FALLBACK.exists():
+            df = pd.read_csv(AGGREGATED_FALLBACK)
+        else:
+            df = pd.DataFrame(
+                columns=[
+                    "Time",
+                    "gols_marcados",
+                    "gols_sofridos",
+                    "cartões",
+                    "vitórias",
+                    "empates",
+                    "derrotas",
+                    "partidas",
+                ]
+            )
+        df = df.set_index("Time")
+        return df
+
+    def _persist_aggregated_table(self, df: pd.DataFrame) -> None:
+        df.sort_index().to_csv(AGGREGATED_PATH, encoding="utf-8-sig")
+        logging.info("Tabela agregada atualizada (%s).", AGGREGATED_PATH)
+
+    def _update_team_stats(
+        self,
+        df: pd.DataFrame,
+        row: pd.Series,
+        home: bool,
+    ) -> None:
+        team = row["home_team"] if home else row["away_team"]
+        opponent_score = row["away_score"] if home else row["home_score"]
+        own_score = row["home_score"] if home else row["away_score"]
+
+        self._ensure_team_row(df, team)
+
+        df.at[team, "gols_marcados"] += own_score or 0
+        df.at[team, "gols_sofridos"] += opponent_score or 0
+        df.at[team, "partidas"] += 1
+
+        result = None
+        if row["winner"] == "HOME_TEAM":
+            result = "vitórias" if home else "derrotas"
+        elif row["winner"] == "AWAY_TEAM":
+            result = "vitórias" if not home else "derrotas"
+        else:
+            result = "empates"
+
+        df.at[team, result] += 1
+
+    def update_aggregated_stats(self, new_matches: pd.DataFrame) -> Set[str]:
+        if new_matches.empty:
+            return set()
+
+        agg_df = self._load_aggregated_table()
+        teams_touched: Set[str] = set()
+
+        for _, row in new_matches.iterrows():
+            self._update_team_stats(agg_df, row, home=True)
+            self._update_team_stats(agg_df, row, home=False)
+            teams_touched.add(row["home_team"])
+            teams_touched.add(row["away_team"])
+
+        agg_df = agg_df.astype(
+            {
+                "gols_marcados": "int64",
+                "gols_sofridos": "int64",
+                "cartões": "int64",
+                "vitórias": "int64",
+                "empates": "int64",
+                "derrotas": "int64",
+                "partidas": "int64",
+            },
+            copy=False,
+        )
+
+        self._persist_aggregated_table(agg_df)
+        return teams_touched
+
+    # --------------------------- Odds ------------------------------------- #
+
+    def update_odds(self, teams: Set[str]) -> int:
+        if not teams:
+            logging.info("Nenhum time teve partidas novas; odds preservadas.")
+            return 0
+
+        agg_df = pd.read_csv(AGGREGATED_PATH)
+        subset = agg_df[agg_df["Time"].isin(teams)].copy()
+        if subset.empty:
+            logging.info("Nenhum registro agregado encontrado para atualização.")
+            return 0
+
+        subset = calcular_probabilidades(subset)
+        subset = gerar_analises_em_lote(subset)
+
+        if ODDS_PATH.exists():
+            odds_df = pd.read_csv(ODDS_PATH)
+            odds_df = odds_df[~odds_df["Time"].isin(teams)]
+            combined = pd.concat([odds_df, subset], ignore_index=True)
+        else:
+            combined = subset
+
+        combined.sort_values(by="Time", inplace=True)
+        combined.to_csv(ODDS_PATH, index=False, encoding="utf-8-sig")
+
+        logging.info(
+            "Odds atualizadas para %d time(s) e salvas em %s.",
+            len(teams),
+            ODDS_PATH,
+        )
+        return len(teams)
+
+    # ------------------------- Execução principal ------------------------- #
+
+    def detect_new_matches(
+        self, history: pd.DataFrame, fresh: pd.DataFrame
+    ) -> pd.DataFrame:
+        if history.empty:
+            return fresh
+        already = set(history["match_id"].astype(str))
+        fresh["match_id"] = fresh["match_id"].astype(str)
+        return fresh[~fresh["match_id"].isin(already)]
+
+    def run_once(self) -> AgentResult:
+        result = AgentResult()
+        try:
+            fresh_matches = self.fetch_matches()
+            result.fetched = len(fresh_matches)
+        except Exception as exc:  # noqa: BLE001
+            logging.error("Erro ao consultar API: %s", exc)
+            result.skipped_reason = f"API error: {exc}"
+            return result
+
+        history = self.load_match_history()
+        new_matches = self.detect_new_matches(history, fresh_matches)
+        result.new_matches = len(new_matches)
+
+        if new_matches.empty:
+            logging.info("Nenhuma partida nova encontrada. Aguardando próximo ciclo.")
+            result.skipped_reason = "Nenhuma partida nova"
+            return result
+
+        updated_history = pd.concat([history, new_matches], ignore_index=True)
+        self.persist_match_history(updated_history)
+
+        teams = self.update_aggregated_stats(new_matches)
+        result.teams_updated = teams
+
+        updated_count = self.update_odds(teams)
+        result.odds_updated = updated_count
+
+        logging.info(
+            "Execução concluída: %d partidas novas, %d time(s) atualizados.",
+            result.new_matches,
+            result.odds_updated,
+        )
+        return result
+
+    async def run_forever(self) -> None:
+        while True:
+            start = datetime.now(timezone.utc)
+            logging.info("Iniciando ciclo de automação às %s.", start.isoformat())
+
+            result = self.run_once()
+
+            if self.config.discord_webhook:
+                summary = self._build_summary_message(result, start)
+                send_discord_notification(self.config.discord_webhook, summary)
+
+            elapsed = datetime.now(timezone.utc) - start
+            sleep_for = max(self.config.fetch_interval - int(elapsed.total_seconds()), 5)
+            logging.info("Próxima verificação em %d segundos.", sleep_for)
+            await asyncio.sleep(sleep_for)
+
+    @staticmethod
+    def _build_summary_message(result: AgentResult, start: datetime) -> str:
+        timestamp = start.strftime("%Y-%m-%d %H:%M UTC")
+        if result.skipped_reason:
+            return (
+                f"🟡 Automação de odds ({timestamp})\n"
+                f"- Partidas consultadas: {result.fetched}\n"
+                f"- Atualização ignorada: {result.skipped_reason}"
+            )
+        return (
+            f"✅ Automação de odds ({timestamp})\n"
+            f"- Partidas novas: {result.new_matches}\n"
+            f"- Times atualizados: {', '.join(sorted(result.teams_updated)) or 'nenhum'}\n"
+            f"- Odds recalculadas: {result.odds_updated}"
+        )
+
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Agente autônomo para atualização de odds do Brasileirão."
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Executa apenas um ciclo de atualização.",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=None,
+        help="Intervalo em segundos entre verificações (padrão: 900).",
+    )
+    parser.add_argument(
+        "--competition",
+        type=str,
+        default=None,
+        help="Código da competição na API Football-Data (padrão: BSA).",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        help="Nível de log (DEBUG, INFO, WARNING, ERROR).",
+    )
+    return parser.parse_args()
+
+
+def build_config(args: argparse.Namespace) -> AgentConfig:
+    load_dotenv()
+
+    api_token = os.getenv("API_KEY")
+    if not api_token:
+        raise EnvironmentError("API_KEY não configurada no .env.")
+
+    discord_webhook = os.getenv("DISCORD_WEBHOOK_URL")
+
+    config = AgentConfig(
+        api_token=api_token,
+        competition=args.competition or os.getenv("COMPETITION_CODE", "BSA"),
+        fetch_interval=args.interval or int(os.getenv("FETCH_INTERVAL", 900)),
+        discord_webhook=discord_webhook,
+    )
+    return config
+
+
+def main() -> None:
+    args = parse_args()
+    setup_logging(getattr(logging, args.log_level.upper(), logging.INFO))
+
+    try:
+        config = build_config(args)
+    except Exception as exc:  # noqa: BLE001
+        logging.error("Falha na configuração do agente: %s", exc)
+        raise SystemExit(1) from exc
+
+    agent = OddsAutomationAgent(config)
+
+    if args.once:
+        result = agent.run_once()
+        logging.info("Resultado final: %s", result)
+    else:
+        try:
+            asyncio.run(agent.run_forever())
+        except KeyboardInterrupt:
+            logging.info("Execução interrompida manualmente.")
+
+
+if __name__ == "__main__":
+    main()

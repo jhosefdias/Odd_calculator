@@ -1,0 +1,77 @@
+from rich.console import Console
+import os
+import sys
+import time
+import importlib.util
+from importlib.machinery import SourceFileLoader
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+
+from analisador_odds import executar_analise_completa
+
+console = Console()
+_interface_module = None
+
+
+def _carregar_interface():
+    global _interface_module
+    if _interface_module is not None:
+        return _interface_module
+
+    interface_path = os.path.join(PROJECT_ROOT, "Terminal", "Interface")
+    if not os.path.exists(interface_path):
+        raise FileNotFoundError(f"Interface não encontrada em {interface_path}")
+
+    loader = SourceFileLoader("odds_interface", interface_path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise ImportError("Não foi possível criar o spec para a interface.")
+
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    _interface_module = module
+    return module
+
+
+def mostrar_menu():
+    console.print("[bold cyan]Analisador de Odds — Menu[/bold cyan]")
+    console.print("1️⃣  Executar análise completa")
+    console.print("2️⃣  Exibir últimas odds")
+    console.print("3️⃣  Limpar tela")
+    console.print("4️⃣  Sair")
+    return input("\n[c]Opção → [/c]")
+
+def executar():
+    console.print("\n[green]Iniciando análise completa...[/green]")
+    inicio = time.time()
+    try:
+        executar_analise_completa()
+        fim = time.time() - inicio
+        console.print(f"[bold green]✅ Análise concluída com sucesso! ({fim:.1f}s)[/bold green]")
+    except Exception as e:
+        console.print(f"[bold red]❌ Erro ao executar análise:[/bold red] {e}")
+
+def exibir_odds():
+    interface = _carregar_interface()
+    interface.exibir_odds()
+
+def limpar_tela():
+    os.system("cls" if os.name == "nt" else "clear")
+
+if __name__ == "__main__":
+    while True:
+        opcao = mostrar_menu().strip()
+        if opcao == "1":
+            executar()
+        elif opcao == "2":
+            exibir_odds()
+        elif opcao == "3":
+            limpar_tela()
+        elif opcao == "4":
+            console.print("[yellow]Encerrando o programa...[/yellow]")
+            break
+        else:
+            console.print("[red]Opção inválida![/red]")

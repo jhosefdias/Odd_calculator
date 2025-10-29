@@ -1,0 +1,165 @@
+from rich.console import Console
+from rich.table import Table
+from rich import box
+import subprocess
+import os
+import sys
+import re
+import unicodedata
+import pandas as pd
+
+console = Console()
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ODDS_FILE = os.path.join(PROJECT_ROOT, "brasileirao_2025_odds.csv")
+
+def mostrar_menu():
+    console.print("[bold cyan]Analisador de Odds — Menu[/bold cyan]")
+    console.print("1️⃣  Executar análise completa")
+    console.print("2️⃣  Exibir últimas odds")
+    console.print("3️⃣  Sair")
+    return input("\nSelecione uma opção: ")
+
+def executar_analise():
+    console.print("\n[green]Executando análise...[/green]")
+    subprocess.run([sys.executable, os.path.join(PROJECT_ROOT, "analisador_odds.py")], check=True)
+
+def exibir_odds():
+    if not os.path.exists(ODDS_FILE):
+        console.print("[red]Nenhum arquivo de odds encontrado. Execute a análise primeiro.[/red]")
+        return
+
+    df = pd.read_csv(ODDS_FILE).sort_values(by="Time", kind="stable").reset_index(drop=True)
+    table = Table(
+        title="Odds e Análises IA",
+        caption="[dim]Aqui estão as análises curtas para cada time.[/dim]",
+        box=box.ROUNDED,
+        show_lines=True,
+        header_style="bold magenta"
+    )
+    table.add_column("Time", style="bold cyan", justify="left", no_wrap=True)
+    table.add_column("Vitória", style="green", justify="right")
+    table.add_column("Empate", style="yellow", justify="right")
+    table.add_column("Derrota", style="red", justify="right")
+    table.add_column(
+        "Análise IA (resumo por time)",
+        style="white",
+        justify="left",
+        overflow="fold",
+        min_width=40,
+        max_width=90,
+        no_wrap=False,
+    )
+
+    def fmt(valor):
+        if pd.isna(valor):
+            return "-"
+        return f"{float(valor):.2f}"
+
+    def gerar_analise_padrao(time_nome: str, r):
+        v = r.get("taxa_vitoria")
+        e = r.get("taxa_empate")
+        d = r.get("taxa_derrota")
+        probabilidades = [
+            ("vitória", v),
+            ("empate", e),
+            ("derrota", d),
+        ]
+        validos = [(nome, float(valor)) for nome, valor in probabilidades if pd.notna(valor)]
+        if not validos:
+            return f"Sem dados suficientes para o {time_nome}."
+        ordenados = sorted(validos, key=lambda item: item[1], reverse=True)
+        detalhes = ", ".join(f"{nome} {valor:.1f}%" for nome, valor in ordenados)
+        destaque, valor_topo = ordenados[0]
+        return f"Tendência de {destaque} ({valor_topo:.1f}%). Probabilidades: {detalhes}."
+
+    def normalizar_nome(nome: str) -> str:
+        if not nome:
+            return ""
+        texto = unicodedata.normalize("NFKD", nome)
+        texto = "".join(ch for ch in texto if not unicodedata.combining(ch))
+        return re.sub(r"[^a-z0-9]", "", texto.lower())
+
+    nomes_times = df["Time"].tolist()
+    nomes_validos = {normalizar_nome(nome): nome for nome in nomes_times}
+
+    def extrair_analises_reprocessadas(df_local):
+        analises = {chave: "" for chave in nomes_validos.keys()}
+        corrente = None
+        buffer = []
+
+        for bruto in df_local["analise_ia"].fillna(""):
+            texto = str(bruto).strip()
+            if not texto or texto.lower() == "nan":
+                continue
+
+            match = re.match(
+                r"(?:[-•*]\s*)?(?:\*\*(?P<nome_bold>.+?)\*\*|(?P<nome_simples>[^:–-]+))\s*[:–-]\s*(?P<conteudo>.+)",
+                texto,
+            )
+            if match:
+                nome = match.group("nome_bold") or match.group("nome_simples") or ""
+                chave = normalizar_nome(nome.strip())
+
+                if corrente and buffer and corrente in analises:
+                    analises[corrente] = " ".join(buffer).strip()
+
+                if chave in analises:
+                    corrente = chave
+                    buffer = [match.group("conteudo").strip()]
+                else:
+                    corrente = None
+                    buffer = []
+                continue
+
+            if corrente:
+                buffer.append(texto.lstrip("-•* ").strip())
+
+        if corrente and buffer and corrente in analises:
+            analises[corrente] = " ".join(buffer).strip()
+        return analises
+
+    analises_por_time = extrair_analises_reprocessadas(df)
+
+    for _, r in df.iterrows():
+        time_nome = str(r.get("Time", "")).strip()
+        bruto = r.get("analise_ia", "")
+        analise_val = ""
+        if isinstance(bruto, str):
+            texto = bruto.strip()
+            if texto and not texto.startswith(("Aqui estão as análises curtas",)):
+                match = re.match(
+                    r"(?:[-•*]\s*)?(?:\*\*(?P<nome_bold>.+?)\*\*|(?P<nome_simples>[^:–-]+))\s*[:–-]\s*(?P<conteudo>.+)",
+                    texto,
+                )
+                if match:
+                    nome_detectado = match.group("nome_bold") or match.group("nome_simples") or ""
+                    if normalizar_nome(nome_detectado) == normalizar_nome(time_nome):
+                        analise_val = match.group("conteudo").strip()
+                elif not any(token in texto for token in ("**", "Aqui estão", "Vamos analisar")):
+                    analise_val = texto
+        if not analise_val:
+            analise_val = analises_por_time.get(normalizar_nome(time_nome), "")
+        if not analise_val:
+            analise_val = gerar_analise_padrao(time_nome, r)
+        analise_val = re.sub(r"^[\-\•\*]+\s*", "", str(analise_val)).strip()
+        analise_val = re.sub(r"\s{2,}", " ", analise_val)
+        table.add_row(
+            time_nome,
+            fmt(r.get("taxa_vitoria")),
+            fmt(r.get("taxa_empate")),
+            fmt(r.get("taxa_derrota")),
+            analise_val
+        )
+    console.print(table)
+
+if __name__ == "__main__":
+    while True:
+        opcao = mostrar_menu()
+        if opcao == "1":
+            executar_analise()
+        elif opcao == "2":
+            exibir_odds()
+        elif opcao == "3":
+            break
+        else:
+            console.print("[red]Opção inválida![/red]")

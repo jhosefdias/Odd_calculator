@@ -1,0 +1,4 @@
+.env
+Alterações a ser realizada
+__pycache__/
+*.pyc
