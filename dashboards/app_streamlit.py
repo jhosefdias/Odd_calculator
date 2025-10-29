@@ -347,7 +347,7 @@ def tabela_top_n(df: pd.DataFrame, top_n: int) -> None:
                 "taxa_derrota": "{:.1f}",
             }
         ),
-        use_container_width=True,
+        width="stretch",
     )
 
 
@@ -375,7 +375,7 @@ def charts_overview(df: pd.DataFrame) -> None:
             labels={"Time": "Time", metrica: titulo},
         )
         fig.update_layout(margin=dict(l=10, r=10, t=40, b=0), xaxis_title=None)
-        col.plotly_chart(fig, use_container_width=True)
+        col.plotly_chart(fig, width="stretch")
 
 
 def simular_confronto_tab(df: pd.DataFrame) -> None:
@@ -463,7 +463,7 @@ def simular_confronto_tab(df: pd.DataFrame) -> None:
         }
     )
 
-    st.dataframe(resultados_df, use_container_width=True, hide_index=True)
+    st.dataframe(resultados_df, width="stretch", hide_index=True)
 
     st.caption(
         "Modelagem baseada na média de gols e cartões por partida, vantagem de mando fixa em 25% e forma recente (taxa de vitória)."
@@ -499,7 +499,7 @@ def simular_confronto_tab(df: pd.DataFrame) -> None:
         }
     )
 
-    st.dataframe(cartoes_df, use_container_width=True, hide_index=True)
+    st.dataframe(cartoes_df, width="stretch", hide_index=True)
 
     col_cartoes_casa, col_cartoes_visitante = st.columns(2)
     col_cartoes_casa.metric("Cartões esperados mandante", f"{info_cartoes['esperados_mandante']:.2f}")
@@ -528,8 +528,8 @@ def simular_confronto_tab(df: pd.DataFrame) -> None:
 
     with st.form("chatbot_gemini_form"):
         pergunta = st.text_area(
-            "Pergunta para o modelo",
-            placeholder="Ex.: Qual mercado parece mais seguro? Ou: Quais riscos devo considerar?",
+            "Pergunte para o assitente",
+            placeholder="EX:Qual mercado seria bom apostar?",
         )
         enviar = st.form_submit_button("Perguntar ao Gemini")
 
@@ -548,8 +548,8 @@ def validar_colunas(df: pd.DataFrame) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Odd Calculator — Dashboard", layout="wide")
-    st.title("Odd Calculator — Dashboard")
+    st.set_page_config(page_title="Odd Calculator", layout="wide")
+    st.title("Odd Calculator")
     st.caption("Painel interativo para acompanhar probabilidades e odds projetadas.")
 
     st.sidebar.header("Filtros & Ações")
