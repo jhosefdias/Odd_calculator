@@ -46,7 +46,6 @@ def _normalizar_nome(nome: str) -> str:
 
 
 def _extrair_analises_por_time(texto: str, nomes_times):
-    """Mapeia a resposta livre da IA para cada time conhecido."""
     if not texto:
         return ["" for _ in nomes_times]
 

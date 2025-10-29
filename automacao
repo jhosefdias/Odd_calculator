@@ -49,7 +49,7 @@ LOGS_DIR.mkdir(exist_ok=True)
 class AgentConfig:
     api_token: str
     competition: str = "BSA"
-    fetch_interval: int = 900  # 15 minutos
+    fetch_interval: int = 900  
     discord_webhook: Optional[str] = None
 
 
